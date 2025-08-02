@@ -138,7 +138,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
             add_branch_tokens=True
         )
 
-        expected_shape = (B, T, 130, 4096)
+        expected_shape = (B, T, 130, 4096)  # 确认与你 init 参数一致(enable_endo=True, enable_pmc=True, add_branch_tokens=True)
         self.assertEqual(visual_tokens.shape, expected_shape)
         print("DualVisualAdapter输出token维度验证成功:", visual_tokens.shape)
 
