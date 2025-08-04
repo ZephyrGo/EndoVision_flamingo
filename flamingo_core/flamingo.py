@@ -36,7 +36,9 @@ class Flamingo(nn.Module):
         :param input_ids:
         :return:
         """
-        assert vision_x.ndim == 6
+        if vision_x.ndim == 5:  # (B, T, C, H, W)
+            vision_x = vision_x.unsqueeze(2)  # 转换为 (B, T, N=1, C, H, W)
+        assert vision_x.ndim == 6, f"Expected 6D tensor, got {vision_x.ndim}D"
         b, T, F, c, h, w = vision_x.shape
 
         if F == 1:

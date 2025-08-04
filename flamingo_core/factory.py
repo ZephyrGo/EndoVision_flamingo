@@ -62,7 +62,7 @@ def create_model_and_transforms(
 
     # 初始化双轨视觉编码器
     vision_encoder = DualVisualAdapter(
-        endo_cfg=kwargs.get('endo_cfg', {}),
+        cfg=kwargs.get('endo_cfg', {}),
         endo_checkpoint_path=endo_checkpoint_path,
         pmc_checkpoint_path=pmc_checkpoint_path,
         target_hidden_dim=target_hidden_dim,

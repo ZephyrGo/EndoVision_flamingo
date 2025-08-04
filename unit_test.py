@@ -1,9 +1,82 @@
 import torch
 import unittest
+import torch.nn as nn
 from flamingo_core.flamingo import Flamingo
 from flamingo_core.dual_visual_adapter import DualVisualAdapter
 from flamingo_core.bentsao_model import BenTsaoWithFlamingoCrossAttention
 from transformers import AutoTokenizer
+
+
+class DummyConfig:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+class DummyLangEncoder(nn.Module):
+    def __init__(self, vocab_size=32000):
+        super(DummyLangEncoder, self).__init__()
+        self.config = type('DummyConfig', (), {'vocab_size': vocab_size})
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, image_embeds=None, media_locations=None, **kwargs):
+        B, seq_len = input_ids.shape
+        logits = torch.randn(B, seq_len, self.config.vocab_size, device=input_ids.device)
+        return type('DummyOutput', (), {'logits': logits})
+
+    def generate(self, input_ids=None, attention_mask=None, image_embeds=None, media_locations=None, **kwargs):
+        return ["mocked generated text"] * input_ids.shape[0]
+
+
+
+class DummyBatchEncoding(dict):
+    def to(self, device):
+        return {k: v.to(device) for k, v in self.items()}
+
+
+class DummyTokenizer:
+    def __init__(self):
+        self.token_to_id = {
+            "<pad>": 0, "<bos>": 1, "<eos>": 2,
+            "<|endofchunk|>": 3, "<image>": 4, "hello": 5, "world": 6, "test": 7
+        }
+        self.pad_token = "<pad>"
+        self.additional_special_tokens = set()
+
+    def __call__(self, texts, return_tensors=None, padding=False):
+        texts = [texts] if isinstance(texts, str) else texts
+        encoded_batches = []
+        for text in texts:
+            ids = [self.token_to_id.get("<bos>", 1)]
+            for word in text.lower().split():
+                ids.append(self.token_to_id.get(word, 99))
+            ids.append(self.token_to_id.get("<eos>", 2))
+            encoded_batches.append(ids)
+
+        if padding:
+            max_len = max(len(ids) for ids in encoded_batches)
+            padded = [ids + [self.token_to_id[self.pad_token]] * (max_len - len(ids)) for ids in encoded_batches]
+        else:
+            padded = encoded_batches
+
+        input_ids = torch.tensor(padded, dtype=torch.long)
+
+        result = DummyBatchEncoding({"input_ids": input_ids})
+
+        return result if return_tensors == 'pt' else dict(result)
+
+    def convert_tokens_to_ids(self, token):
+        return self.token_to_id.get(token, 99)
+
+    def add_special_tokens(self, special_tokens_dict):
+        tokens = special_tokens_dict.get("additional_special_tokens", [])
+        for token in tokens:
+            if token not in self.token_to_id:
+                self.token_to_id[token] = len(self.token_to_id)
+                self.additional_special_tokens.add(token)
+        pad_token = special_tokens_dict.get("pad_token")
+        if pad_token:
+            self.pad_token = pad_token
+            if pad_token not in self.token_to_id:
+                self.token_to_id[pad_token] = len(self.token_to_id)
+
 
 class TestDualVisualFlamingoWithLM(unittest.TestCase):
     def setUp(self):
@@ -13,45 +86,42 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
             class DATA:
                 TRAIN_CROP_SIZE = 224
                 NUM_FRAMES = 8
+
             class MODEL:
                 NUM_CLASSES = 0
+
             class TIMESFORMER:
                 ATTENTION_TYPE = 'divided_space_time'
                 PRETRAINED_MODEL = ''
 
         self.dummy_cfg = DummyCfg()
 
-        # 加载双轨视觉适配器
+        # 双轨视觉适配器
         self.adapter = DualVisualAdapter(
-            endo_cfg=self.dummy_cfg,
+            cfg=self.dummy_cfg,
             endo_checkpoint_path='checkpoints/endo_fm_convert.pth',
-            pmc_checkpoint_path='checkpoints/pmc_clip.pth',
+            pmc_checkpoint_path='checkpoints/pmc_clip_visual_only.pt',
             target_hidden_dim=4096,
             num_latents=64,
             perceiver_depth=2,
             perceiver_heads=8,
             perceiver_dim_head=64,
+            enable_endo=True,
+            enable_pmc=True,
             freeze_endo=True,
-            freeze_pmc=True
+            freeze_pmc=True,
+            add_branch_tokens=True
         ).to(self.device)
 
-        # 加载真实语言模型
-        lang_encoder_path = 'path/to/lang_model'
-        tokenizer_path = 'path/to/tokenizer'
-
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        # 使用扩展后的DummyTokenizer
+        self.tokenizer = DummyTokenizer()
         self.tokenizer.add_special_tokens({
             "additional_special_tokens": ["<|endofchunk|>", "<image>"],
-            "pad_token": "<PAD>"
+            "pad_token": "<pad>"
         })
 
-        self.lang_encoder = BenTsaoWithFlamingoCrossAttention.from_pretrained(
-            lang_encoder_path,
-            cross_attn_every_n_layers=1,
-            finetune_lm=False
-        ).to(self.device)
-
-        self.lang_encoder.resize_token_embeddings(len(self.tokenizer))
+        # DummyLangEncoder
+        self.lang_encoder = DummyLangEncoder().to(self.device)
 
         self.model = Flamingo(
             vision_encoder=self.adapter,
@@ -79,7 +149,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         input_ids = inputs['input_ids']
 
         output = self.model(
-            vision_x={'video_frames': video_tensor, 'images': image_tensor},
+            vision_x=image_tensor,
             lang_x=input_ids
         )
 
@@ -89,7 +159,6 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
 
     def test_generation(self):
         B, T, C, H, W = 2, 8, 3, 224, 224
-        video_tensor = torch.randn(B, T, C, H, W, device=self.device)
         image_tensor = torch.randn(B, T, C, H, W, device=self.device)
 
         inputs = self.tokenizer(
@@ -99,14 +168,14 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         ).to(self.device)
 
         generated_texts = self.model.generate(
-            vision_x={'video_frames': video_tensor, 'images': image_tensor},
+            vision_x=image_tensor,  # 直接传入正确的维度 (B,T,3,H,W)
             lang_x=inputs['input_ids'],
             max_length=50
         )
 
         self.assertEqual(len(generated_texts), B)
         for idx, text in enumerate(generated_texts):
-            print(f"Generated text {idx+1}: {text}")
+            print(f"Generated text {idx + 1}: {text}")
 
     def test_memory_efficiency(self):
         B, T, C, H, W = 2, 8, 3, 224, 224
@@ -117,7 +186,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         inputs = self.tokenizer(["<image> Test memory usage"], return_tensors='pt').to(self.device)
 
         _ = self.model(
-            vision_x={'video_frames': video_tensor, 'images': image_tensor},
+            vision_x=image_tensor,
             lang_x=inputs['input_ids']
         )
 
@@ -128,19 +197,19 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
     def test_adapter_output_shape(self):
         B, T, C, H, W = 1, 8, 3, 224, 224
         video_tensor = torch.randn(B, T, C, H, W, device=self.device)
-        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
 
-        visual_tokens = self.adapter(
-            video_frames=video_tensor,
-            images=image_tensor,
-            enable_endo=True,
-            enable_pmc=True,
-            add_branch_tokens=True
-        )
 
-        expected_shape = (B, T, 130, 4096)  # 确认与你 init 参数一致(enable_endo=True, enable_pmc=True, add_branch_tokens=True)
+        visual_tokens = self.adapter(vision_x=video_tensor)  # 或 image_tensor
+
+        expected_shape = (B, T, 65, 4096)  # 确认与你 init 参数一致(enable_endo=True, enable_pmc=True, add_branch_tokens=True)
         self.assertEqual(visual_tokens.shape, expected_shape)
-        print("DualVisualAdapter输出token维度验证成功:", visual_tokens.shape)
+        print("DualVisualAdapter视频输入，输出token维度验证成功:", visual_tokens.shape)  # 验证图片输入
+        T = 1
+        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
+        visual_tokens = self.adapter(vision_x=image_tensor)
+        expected_shape = (B, T, 130, 4096)
+        self.assertEqual(visual_tokens.shape, expected_shape)
+        print("DualVisualAdapter图片输入，输出token维度验证成功:", visual_tokens.shape)
 
     def test_trainable_parameters(self):
         trainable = [name for name, p in self.model.named_parameters() if p.requires_grad]

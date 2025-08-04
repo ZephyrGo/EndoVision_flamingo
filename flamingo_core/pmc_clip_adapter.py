@@ -22,26 +22,17 @@ class PMCClipAdapter(nn.Module):
         embed_dim = 64 * 32  # 2048, ResNet50 conv feature dimension
         heads = embed_dim // 64  # e.g. 32 heads for 2048-d embed_dim
         self.pmc_model = ModifiedResNet(layers=[3, 4, 6, 3], output_dim=embed_dim,
-                                        heads=heads, input_resolution=224, width=64)
+                                        heads=heads, width=64)
         # Load PMC-CLIP pre-trained weights
         ckpt = torch.load(pmc_checkpoint_path, map_location='cpu')
         # Extract vision branch weights (keys starting with "visual.") and skip attnpool/projection layers
-        state_dict = {}
+        filtered_state_dict = {}
         for k, v in ckpt.items():
-            # Remove DataParallel prefix if present
-            if k.startswith("module.visual."):
-                key = k[len("module.visual."):]
-            elif k.startswith("visual."):
-                key = k[len("visual."):]
-            else:
-                continue
-            # Skip AttentionPool2d and projection (text/mlm projection, logit_scale) weights
-            if key.startswith("attnpool") or key.startswith("text_projection") \
-               or key.startswith("mlm_projection") or key.startswith("logit_scale"):
-                continue
-            state_dict[key] = v
-        # Load weights into the model (ignore missing keys for skipped layers)
-        missing = self.pmc_model.load_state_dict(state_dict, strict=False)
+            if k.startswith("attnpool"):
+                continue  # 跳过注意力汇聚层（attnpool）和投影层（c_proj）
+            filtered_state_dict[k] = v
+
+        missing = self.pmc_model.load_state_dict(filtered_state_dict, strict=False)
         print(f"Loaded PMC-CLIP checkpoint. Missing keys: {missing.missing_keys}, "
               f"Unexpected keys: {missing.unexpected_keys}")
         # Freeze PMC-CLIP backbone parameters if specified
@@ -70,15 +61,14 @@ class PMCClipAdapter(nn.Module):
         """
         B, T, C, H, W = images.shape
         # Combine batch and T dims for backbone forward: (B*T, C, H, W)
-        images_flat = images.view(B * T, C, H, W)
+        images_flat = images.reshape(B * T, C, H, W)
         # Forward through ResNet50 backbone (conv layers only, exclude attnpool)
         x = images_flat.type(self.pmc_model.conv1.weight.dtype)
         # Stem: 3 conv layers with ReLU and AvgPool (anti-aliased downsampling)
-        for conv, bn in [(self.pmc_model.conv1, self.pmc_model.bn1),
-                         (self.pmc_model.conv2, self.pmc_model.bn2),
-                         (self.pmc_model.conv3, self.pmc_model.bn3)]:
-            x = self.pmc_model.relu(bn(conv(x)))
-            x = self.pmc_model.avgpool(x)
+        x = self.pmc_model.relu1(self.pmc_model.bn1(self.pmc_model.conv1(x)))
+        x = self.pmc_model.relu2(self.pmc_model.bn2(self.pmc_model.conv2(x)))
+        x = self.pmc_model.relu3(self.pmc_model.bn3(self.pmc_model.conv3(x)))
+        x = self.pmc_model.avgpool(x)
         # ResNet layers 1-4
         x = self.pmc_model.layer1(x)
         x = self.pmc_model.layer2(x)

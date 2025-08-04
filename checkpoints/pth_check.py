@@ -1,20 +1,20 @@
 import torch
 
-# 加载 checkpoint
-ckpt = torch.load('endo_fm_convert.pth', map_location='cpu')
-
-# # 保存干净的视觉编码器权重
-# student = ckpt["student"]
-# torch.save(student, "endo_vit_backbone.pth")
-
-# 打印 key 和 shape
-for k, v in ckpt.items():
-    print(f"{k:60s} → {tuple(v.shape)}")
-
-with open('endo_fm_convert_keys.txt', 'w') as f:
-    for k, v in ckpt.items():
-        print(f"{k}: {v.shape}")
-        f.write(f"{k}: {tuple(v.shape)}\n")  # 将张量维度转换为 tuple 便于可读
+# # 加载 checkpoint
+# ckpt = torch.load('endo_fm_convert.pth', map_location='cpu')
+#
+# # # 保存干净的视觉编码器权重
+# # student = ckpt["student"]
+# # torch.save(student, "endo_vit_backbone.pth")
+#
+# # 打印 key 和 shape
+# for k, v in ckpt.items():
+#     print(f"{k:60s} → {tuple(v.shape)}")
+#
+# with open('endo_fm_convert_keys.txt', 'w') as f:
+#     for k, v in ckpt.items():
+#         print(f"{k}: {v.shape}")
+#         f.write(f"{k}: {tuple(v.shape)}\n")  # 将张量维度转换为 tuple 便于可读
 
 
 # def inspect_pth_file(pth_path):
@@ -70,12 +70,29 @@ with open('endo_fm_convert_keys.txt', 'w') as f:
 # convert_pth('endo_fm.pth', 'endo_fm_convert.pth')
 
 # 查看pmc_clip.pt结构
-data = torch.load('pmc_clip.pt')
+data = torch.load('pmc_clip_visual_only.pt')
 print(type(data))
 if isinstance(data, dict):
     for key in data.keys():
         print(key)
 with open('pmc_clip_state_dict_keys.txt', 'w') as f:
-    for k, v in data['state_dict'].items():
+    for k, v in data.items():
         print(f"{k}: {v.shape}")
         f.write(f"{k}: {tuple(v.shape)}\n")  # 将张量维度转换为 tuple 便于可读
+# 确认原始checkpoint是否有'state_dict'
+# assert 'state_dict' in data, "state_dict missing!"
+#
+# original_state_dict = data['state_dict']
+# new_state_dict = {}
+#
+# # 仅保留module.visual分支的权重，并去掉前缀
+# for k, v in original_state_dict.items():
+#     if k.startswith('module.visual.'):
+#         new_key = k.replace('module.visual.', '')
+#         new_state_dict[new_key] = v
+#
+# # 保存为新的checkpoint
+# torch.save(new_state_dict, 'pmc_clip_visual_only.pt')
+#
+# # 验证一下
+# print(f"提取了{len(new_state_dict)}个参数，已保存至'pmc_clip_visual_only.pt'。")
