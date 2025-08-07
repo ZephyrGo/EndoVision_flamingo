@@ -50,7 +50,7 @@ class Flamingo(nn.Module):
         vision_x = rearrange(vision_x, "b T c h w -> b c T h w")
 
         # 调用Endo-FM视觉编码器，明确输出维度：(b, num_latents, hidden_dim)
-        vision_x = self.vision_encoder(vision_x)  # EndoFMAdapter输出：(b, num_latents, d)
+        vision_x = self.vision_encoder(vision_x)["fused_tokens"]  # EndoFMAdapter输出：(b, num_latents, d)
 
         # print(f"[Before rearrange] vision_x.shape={vision_x.shape}")
         if vision_x.ndim == 4:
