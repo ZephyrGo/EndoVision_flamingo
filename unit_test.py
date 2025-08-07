@@ -5,6 +5,7 @@ from flamingo_core.flamingo import Flamingo
 from flamingo_core.dual_visual_adapter import DualVisualAdapter
 from flamingo_core.bentsao_model import BenTsaoWithFlamingoCrossAttention
 from transformers import AutoTokenizer
+#受限于显存、未加载真实语言模型
 
 
 class DummyConfig:
@@ -23,7 +24,6 @@ class DummyLangEncoder(nn.Module):
 
     def generate(self, input_ids=None, attention_mask=None, image_embeds=None, media_locations=None, **kwargs):
         return ["mocked generated text"] * input_ids.shape[0]
-
 
 
 class DummyBatchEncoding(dict):
@@ -200,6 +200,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
 
 
         visual_tokens = self.adapter(vision_x=video_tensor)  # 或 image_tensor
+        visual_tokens = visual_tokens["fused_tokens"]
 
         expected_shape = (B, T, 65, 4096)  # 确认与你 init 参数一致(enable_endo=True, enable_pmc=True, add_branch_tokens=True)
         self.assertEqual(visual_tokens.shape, expected_shape)
@@ -207,6 +208,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         T = 1
         image_tensor = torch.randn(B, T, C, H, W, device=self.device)
         visual_tokens = self.adapter(vision_x=image_tensor)
+        visual_tokens = visual_tokens["fused_tokens"]
         expected_shape = (B, T, 130, 4096)
         self.assertEqual(visual_tokens.shape, expected_shape)
         print("DualVisualAdapter图片输入，输出token维度验证成功:", visual_tokens.shape)
