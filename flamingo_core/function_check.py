@@ -5,7 +5,7 @@ from PIL import Image
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from torchvision import transforms, io
-from endo_adapter import EndoFMAdapter
+from adapters import DualVisualAdapter
 from endo_fm_backbone.vit_utils import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from endo_fm_backbone.parser import load_config
 import yaml
@@ -33,82 +33,79 @@ def load_and_preprocess_video(video_path, num_frames=8, device='cpu'):
     return stacked
 
 
-def load_model(cfg_path, checkpoint_path, device='cpu'):
+def load_dual_adapter(cfg_path, endo_checkpoint_path, pmc_checkpoint_path, device='cpu'):
     with open(cfg_path, 'r') as f:
         cfg_dict = yaml.safe_load(f)
         cfg = CN(cfg_dict)
 
-    # 直接在这里补充缺失的字段
-    cfg.TIMESFORMER.PRETRAINED_MODEL = checkpoint_path
+    # 明确补充缺失的PRETRAINED_MODEL字段
+    if 'PRETRAINED_MODEL' not in cfg.TIMESFORMER:
+        cfg.TIMESFORMER.PRETRAINED_MODEL = endo_checkpoint_path
 
-    adapter = EndoFMAdapter(
+    adapter = DualVisualAdapter(
         cfg=cfg,
-        endo_checkpoint_path=checkpoint_path,
+        endo_checkpoint_path=endo_checkpoint_path,
+        pmc_checkpoint_path=pmc_checkpoint_path,
         target_hidden_dim=4096,
         num_latents=64,
         perceiver_depth=2,
         perceiver_heads=8,
         perceiver_dim_head=64,
-        freeze_endo=True
+        freeze_endo=True,
+        freeze_pmc=True,
+        enable_endo=True,
+        enable_pmc=True,
+        add_branch_tokens=True
     ).to(device)
-    return adapter, adapter.endo_model
 
-
-def extract_patch_tokens(endo_model, frames):
-    with torch.no_grad():
-        # 明确使用 get_all=True 获取完整的patch tokens序列
-        feats = endo_model.forward_features(frames, get_all=True)
-
-    B, C, T, H, W = frames.shape
-    if feats.dim() == 4:
-        feats = feats[:, :, 1:, :]
-    elif feats.dim() == 3:
-        seq_len = feats.shape[1]
-        feats = feats[:, 1:, :] if seq_len % T != 0 else feats
-        N_patch = feats.shape[1] // T
-        feats = feats.view(B, T, N_patch, feats.shape[-1])
-    else:
-        raise RuntimeError(f"Unexpected feature dimensions: {feats.shape}")
-
-    return feats
+    return adapter
 
 
 
 def extract_adapter_tokens(adapter, frames):
     adapter.eval()
     with torch.no_grad():
-        image_embeds = adapter(frames)
-    return image_embeds
+        output = adapter(frames)
+    return output
 
 
-def visualize_patch_distribution(patch_tokens, adapter, frame_idx=0):
-    proj = adapter.linear_proj(patch_tokens)[0, frame_idx].detach().cpu().numpy()
-    pca = PCA(n_components=2).fit_transform(proj)
-    grid_size = int(np.sqrt(proj.shape[0]))
-    colors = np.arange(proj.shape[0]) // grid_size if grid_size ** 2 == proj.shape[0] else 'blue'
+def visualize_token_distribution(tokens, title="Token Distribution"):
+    B, T, N, D = tokens.shape
+    tokens = tokens[0, 0].detach().cpu().numpy()
+    pca = PCA(n_components=2).fit_transform(tokens)
 
-    plt.figure(figsize=(5, 5))
-    plt.scatter(pca[:, 0], pca[:, 1], c=colors, cmap='viridis', alpha=0.8)
-    if isinstance(colors, np.ndarray):
-        plt.colorbar(label='Patch row index')
-    plt.title(f"PCA of Patch Tokens (Frame {frame_idx})")
+    plt.figure(figsize=(6, 6))
+    plt.scatter(pca[:, 0], pca[:, 1], alpha=0.8)
+    plt.title(title)
+    plt.xlabel('PCA Component 1')
+    plt.ylabel('PCA Component 2')
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 
+# def visualize_token_distribution(patch_tokens, adapter, frame_idx=0):
+#     proj = adapter.linear_proj(patch_tokens)[0, frame_idx].detach().cpu().numpy()
+#     pca = PCA(n_components=2).fit_transform(proj)
+#     grid_size = int(np.sqrt(proj.shape[0]))
+#     colors = np.arange(proj.shape[0]) // grid_size if grid_size ** 2 == proj.shape[0] else 'blue'
+#
+#     plt.figure(figsize=(5, 5))
+#     plt.scatter(pca[:, 0], pca[:, 1], c=colors, cmap='viridis', alpha=0.8)
+#     if isinstance(colors, np.ndarray):
+#         plt.colorbar(label='Patch row index')
+#     plt.title(f"PCA of Patch Tokens (Frame {frame_idx})")
+#     plt.tight_layout()
+#     plt.show()
 
-
-
-def visualize_temporal_norm(patch_tokens, adapter_tokens, adapter):
-    patch_proj = adapter.linear_proj(patch_tokens)[0]
-    adapter_proj = adapter_tokens[0]
-    T = min(patch_proj.shape[0], adapter_proj.shape[0])
-
-    p_norm = [torch.norm(patch_proj[t], dim=1).mean().item() for t in range(T)]
-    a_norm = [torch.norm(adapter_proj[t], dim=1).mean().item() for t in range(T)]
-
+def visualize_token_norm(tokens_dict):
     plt.figure(figsize=(6, 4))
-    plt.plot(range(T), p_norm, marker='o', label="Patch tokens")
-    plt.plot(range(T), a_norm, marker='s', label="Adapter tokens")
+    for name, tokens in tokens_dict.items():
+        if tokens is not None:
+            norm = torch.norm(tokens[0], dim=-1).mean(dim=-1).cpu().numpy()
+            plt.plot(norm, marker='o', label=name)
+        else:
+            print(f"Warning: {name} is None, skipped.")
+
     plt.title("Mean Token L2 Norm per Frame")
     plt.xlabel("Frame Index")
     plt.ylabel("Mean L2 Norm")
@@ -119,29 +116,38 @@ def visualize_temporal_norm(patch_tokens, adapter_tokens, adapter):
 
 
 
-def summarize_dimensions(video_frames, patch_tokens, adapter_tokens):
+def summarize_dimensions(video_frames, output):
     B, C, T, H, W = video_frames.shape
-    _, _, N_patch, D_orig = patch_tokens.shape
-    _, _, num_latents, D_target = adapter_tokens.shape
-
     print("\n=== Feature Dimension Summary ===")
     print(f"Input: B={B}, C={C}, T={T}, H={H}, W={W}")
-    print(f"Patch token shape: (B, T, {N_patch}, {D_orig})")
-    print(f"Adapter output shape: (B, T, {num_latents}, {D_target})")
+
+    for key, tokens in output.items():
+        if tokens is not None:
+            _, _, N, D = tokens.shape
+            print(f"{key} shape: (B, T, {N}, {D})")
+        else:
+            print(f"{key} is None.")
 
 
-# =================== 主程序调用 ===================
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     video_path = "../data/check_func/endoscope_video.mp4"
-    checkpoint_path = "../checkpoints/endo_fm_convert.pth"
+    endo_checkpoint_path = "../checkpoints/endo_fm_convert.pth"
+    pmc_checkpoint_path = "../checkpoints/pmc_clip_visual_only.pt"
     cfg_path = "../endo_fm_backbone/configs/TimeSformer_divST_8x32_224.yaml"
 
     video_frames = load_and_preprocess_video(video_path, device=device)
-    adapter, endo_model = load_model(cfg_path, checkpoint_path, device=device)
-    patch_tokens = extract_patch_tokens(endo_model, video_frames)
-    adapter_tokens = extract_adapter_tokens(adapter, video_frames)
+    adapter = load_dual_adapter(cfg_path, endo_checkpoint_path, pmc_checkpoint_path, device=device)
 
-    summarize_dimensions(video_frames, patch_tokens, adapter_tokens)
-    visualize_patch_distribution(patch_tokens, adapter)
-    visualize_temporal_norm(patch_tokens, adapter_tokens, adapter)
+    output = extract_adapter_tokens(adapter, video_frames)
+
+    summarize_dimensions(video_frames, output)
+
+    visualize_token_distribution(output["fused_tokens"], title="Fused Token Distribution")
+
+    visualize_token_norm({
+        "Fused tokens": output["fused_tokens"],
+        "PMC tokens": output["pmc_tokens"],
+        "Endo tokens": output["endo_tokens"]
+    })

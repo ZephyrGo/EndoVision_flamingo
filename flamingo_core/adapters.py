@@ -112,39 +112,36 @@ class EndoFMAdapter(nn.Module):
 
     def forward(self, video_frames: torch.Tensor) -> torch.Tensor:
         """
-        :param video_frames: (B, T, C, H, W):
-            B: batch大小
-            T: 视频帧数
-            C: 通道数（通常为3，RGB图像）
-            H, W: 图像的高度与宽度
-        :return:
-            (B, T, num_latents, target_hidden_dim)
+        :param video_frames: (B, T, C, H, W)
+        :return: (B, T, num_latents, target_hidden_dim)
         """
         B, T, C, H, W = video_frames.shape
 
-        # 调用Endo-FM模型提取视频时空特征，处理可能的维度排列问题（C与T位置互换）
-        try:
-            features = self.endo_model.forward_features(video_frames, get_all=True)
+        # 1) TimeSformer 期望 (B, C, T, H, W) —— 一律先换轴
+        x = video_frames.permute(0, 2, 1, 3, 4).contiguous()  # (B, C, T, H, W)
 
-        except RuntimeError:
-            # features = self.endo_model(video_frames.permute(0, 2, 1, 3, 4), get_all=True)
-            features = self.endo_model.forward_features(video_frames.permute(0, 2, 1, 3, 4), get_all=True)
+        # 2) 抽特征（TimeSformer 的 get_vit_base_patch16_224）
+        features = self.endo_model.forward_features(x, get_all=True)
 
+        D = self.endo_output_dim  # (= self.endo_model.embed_dim)
+
+        # 3) 统一整理成 (B, T, N_patch, D)
         if features.dim() == 4:
-            patch_tokens = features[:, :, 1:, :]  # 若输出特征为4维，去掉CLS token
+            # 常见返回：(B, T, L, D) 或 (B, T, 1+L, D)；安全地去掉 CLS（若存在）
+            patch_tokens = features[:, :, 1:, :] if features.size(2) > 0 else features
+        elif features.dim() == 3:
+            # 常见返回：(B*T, L, D) 或 (B*T, 1+L, D)
+            tokens_no_cls = features[:, 1:, :] if features.size(1) > 0 else features  # 通常第0个是 CLS
+            L = tokens_no_cls.size(1)  # 每帧 token 数
+            patch_tokens = tokens_no_cls.view(B, T, L, D)
         else:
-            seq_len = features.shape[1]
-            if T > 0 and seq_len % T != 0:
-                patch_tokens = features[:, 1:, :]
-                seq_len = patch_tokens.shape[1]
-            else:
-                patch_tokens = features
-            N_patch = seq_len // T if T > 0 else seq_len
-            patch_tokens = patch_tokens.view(B, T, N_patch, self.endo_output_dim)  # 若为3维，则去掉CLS token后reshape成(B, T, N_patch, 特征维度)
+            raise RuntimeError(f"Unexpected Endo-FM feature shape: {features.shape}")
 
-        mapped_tokens = self.linear_proj(patch_tokens)  # 特征维度由Endo-FM输出维度映射到目标维度
-        image_embeds = self.perceiver_resampler(mapped_tokens)  # 压缩每个视频序列到固定数量的视觉token
+        # 4) 线性映射 + Perceiver 压缩到固定 num_latents
+        mapped_tokens = self.linear_proj(patch_tokens)  # (B, T, N_patch, hidden)
+        image_embeds = self.perceiver_resampler(mapped_tokens)  # (B, T, num_latents, hidden)
         return image_embeds
+
 
 class PMCClipAdapter(nn.Module):
     """

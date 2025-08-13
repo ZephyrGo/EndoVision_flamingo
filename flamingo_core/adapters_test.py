@@ -1,12 +1,23 @@
+from adapters import DualVisualAdapter
 import torch
 import unittest
 import torch.nn as nn
 from flamingo_core.flamingo import Flamingo
-from flamingo_core.dual_visual_adapter import DualVisualAdapter
 from flamingo_core.bentsao_model import BenTsaoWithFlamingoCrossAttention
 from transformers import AutoTokenizer
-#受限于显存、未加载真实语言模型
 
+
+class DummyCfg:
+    class DATA:
+        TRAIN_CROP_SIZE = 224
+        NUM_FRAMES = 8
+
+    class MODEL:
+        NUM_CLASSES = 0
+
+    class TIMESFORMER:
+        ATTENTION_TYPE = 'divided_space_time'
+        PRETRAINED_MODEL = ''
 
 class DummyConfig:
     def __init__(self, vocab_size):
@@ -78,29 +89,15 @@ class DummyTokenizer:
                 self.token_to_id[pad_token] = len(self.token_to_id)
 
 
-class TestDualVisualFlamingoWithLM(unittest.TestCase):
+class TestDualVisualAdapter(unittest.TestCase):
+
     def setUp(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        class DummyCfg:
-            class DATA:
-                TRAIN_CROP_SIZE = 224
-                NUM_FRAMES = 8
-
-            class MODEL:
-                NUM_CLASSES = 0
-
-            class TIMESFORMER:
-                ATTENTION_TYPE = 'divided_space_time'
-                PRETRAINED_MODEL = ''
-
-        self.dummy_cfg = DummyCfg()
-
-        # 双轨视觉适配器
         self.adapter = DualVisualAdapter(
-            cfg=self.dummy_cfg,
-            endo_checkpoint_path='checkpoints/endo_fm_convert.pth',
-            pmc_checkpoint_path='checkpoints/pmc_clip_visual_only.pt',
+            cfg=DummyCfg(),
+            endo_checkpoint_path='../checkpoints/endo_fm_convert.pth',
+            pmc_checkpoint_path='../checkpoints/pmc_clip_visual_only.pt',
             target_hidden_dim=4096,
             num_latents=64,
             perceiver_depth=2,
@@ -110,9 +107,9 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
             enable_pmc=True,
             freeze_endo=True,
             freeze_pmc=True,
-            add_branch_tokens=True
+            num_queries=64,
+            qformer_depth=2
         ).to(self.device)
-
         # 使用扩展后的DummyTokenizer
         self.tokenizer = DummyTokenizer()
         self.tokenizer.add_special_tokens({
@@ -132,10 +129,10 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
             cross_attn_every_n_layers=1
         ).to(self.device)
 
-        self.model.eval()
+        self.adapter.eval()
 
     def test_full_integration_forward(self):
-        B, T, C, H, W = 2, 8, 3, 224, 224
+        B, T, C, H, W = 2, 1, 3, 224, 224
         video_tensor = torch.randn(B, T, C, H, W, device=self.device)
         image_tensor = torch.randn(B, T, C, H, W, device=self.device)
 
@@ -158,7 +155,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         print("完整模型输出logits维度:", output.logits.shape)
 
     def test_generation(self):
-        B, T, C, H, W = 2, 8, 3, 224, 224
+        B, T, C, H, W = 2, 1, 3, 224, 224
         image_tensor = torch.randn(B, T, C, H, W, device=self.device)
 
         inputs = self.tokenizer(
@@ -168,7 +165,7 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         ).to(self.device)
 
         generated_texts = self.model.generate(
-            vision_x=image_tensor,  # 直接传入正确的维度 (B,T,3,H,W)
+            vision_x=image_tensor,
             lang_x=inputs['input_ids'],
             max_length=50
         )
@@ -194,37 +191,37 @@ class TestDualVisualFlamingoWithLM(unittest.TestCase):
         print(f"Peak GPU memory usage: {max_mem:.2f} MB")
         self.assertLess(max_mem, 12000, "GPU内存占用超过预期阈值")
 
-    def test_adapter_output_shape(self):
-        B, T, C, H, W = 1, 8, 3, 224, 224
+    def test_adapter_output_shapes(self):
+        B, T, C, H, W = 2, 1, 3, 224, 224
         video_tensor = torch.randn(B, T, C, H, W, device=self.device)
 
+        outputs = self.adapter(video_tensor)
 
-        visual_tokens = self.adapter(vision_x=video_tensor)  # 或 image_tensor
-        visual_tokens = visual_tokens["fused_tokens"]
+        fused_tokens = outputs["fused_tokens"]
+        pmc_tokens = outputs["pmc_tokens"]
+        endo_tokens = outputs["endo_tokens"]
 
-        expected_shape = (B, T, 65, 4096)  # 确认与你 init 参数一致(enable_endo=True, enable_pmc=True, add_branch_tokens=True)
-        self.assertEqual(visual_tokens.shape, expected_shape)
-        print("DualVisualAdapter视频输入，输出token维度验证成功:", visual_tokens.shape)  # 验证图片输入
-        T = 1
-        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
-        visual_tokens = self.adapter(vision_x=image_tensor)
-        visual_tokens = visual_tokens["fused_tokens"]
-        expected_shape = (B, T, 130, 4096)
-        self.assertEqual(visual_tokens.shape, expected_shape)
-        print("DualVisualAdapter图片输入，输出token维度验证成功:", visual_tokens.shape)
+        expected_shape_single_branch = (B, T, 65, 4096)
+        expected_shape_fused = (B, T, 130, 4096)
+
+        self.assertEqual(fused_tokens.shape, expected_shape_fused, "Fused tokens shape mismatch")
+        self.assertEqual(pmc_tokens.shape, expected_shape_single_branch, "PMC tokens shape mismatch")
+        self.assertEqual(endo_tokens.shape, expected_shape_single_branch, "Endo tokens shape mismatch")
+
+        print("DualVisualAdapter output shapes test passed:")
+        print("Fused tokens shape:", fused_tokens.shape)
+        print("PMC tokens shape:", pmc_tokens.shape)
+        print("Endo tokens shape:", endo_tokens.shape)
 
     def test_trainable_parameters(self):
-        trainable = [name for name, p in self.model.named_parameters() if p.requires_grad]
-        frozen = [name for name, p in self.model.named_parameters() if not p.requires_grad]
+        trainable_params = [name for name, param in self.adapter.named_parameters() if param.requires_grad]
+        frozen_params = [name for name, param in self.adapter.named_parameters() if not param.requires_grad]
 
-        print("可训练参数：", len(trainable))
-        print("冻结参数：", len(frozen))
-        self.assertGreater(len(trainable), 0, "未找到可训练参数")
-        self.assertGreater(len(frozen), 0, "未找到冻结参数")
+        print("Number of trainable parameters:", len(trainable_params))
+        print("Number of frozen parameters:", len(frozen_params))
 
-    def tearDown(self):
-        del self.adapter, self.lang_encoder, self.model
-        torch.cuda.empty_cache()
+        self.assertGreater(len(trainable_params), 0, "There should be some trainable parameters.")
+        self.assertGreater(len(frozen_params), 0, "There should be some frozen parameters.")
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, exit=False)

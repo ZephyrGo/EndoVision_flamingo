@@ -47,7 +47,7 @@ class Flamingo(nn.Module):
             vision_x = vision_x.mean(dim=2)  # (b, T, c, h, w)
 
         # 明确将维度调整为 (B, C, T, H, W)，与Endo-FM模型兼容
-        vision_x = rearrange(vision_x, "b T c h w -> b c T h w")
+        # vision_x = rearrange(vision_x, "b T c h w -> b c T h w")
 
         # 调用Endo-FM视觉编码器，明确输出维度：(b, num_latents, hidden_dim)
         vision_x = self.vision_encoder(vision_x)["fused_tokens"]  # EndoFMAdapter输出：(b, num_latents, d)
