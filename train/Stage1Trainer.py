@@ -410,6 +410,7 @@ class Stage1PMCTrainer:
 
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"当前使用的 GPU ID: {torch.cuda.current_device()}")
             print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
         # 重要：模型已经在factory中设置为fp16，这里不再移动
@@ -546,7 +547,7 @@ class Stage1PMCTrainer:
 
     def train_epoch(self, epoch):
         """
-        训练一个epoch - 修复FP16梯度问题
+        训练一个epoch - 使用混合精度
         """
         self.model.train()
         total_loss = 0
@@ -603,9 +604,9 @@ class Stage1PMCTrainer:
                         # 先unscale梯度
                         self.scaler.unscale_(self.optimizer)
                         
-                        # 梯度裁剪
+                        # fp32下的梯度裁剪
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
+                            [p for p in self.model.parameters() if p.requires_grad],
                             self.config.get("max_grad_norm", 1.0)
                         )
                         
@@ -634,7 +635,7 @@ class Stage1PMCTrainer:
                     
                     if (step + 1) % self.gradient_accumulation_steps == 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
+                            [p for p in self.model.parameters() if p.requires_grad],
                             self.config.get("max_grad_norm", 1.0)
                         )
                         self.optimizer.step()
@@ -671,13 +672,13 @@ class Stage1PMCTrainer:
                 if step % 100 == 0:
                     self.monitor_memory()
                     
-                # 定期保存checkpoint
+                # 定期保存checkpoint（只保存可训练参数）
                 if self.global_step > 0 and self.global_step - last_save_step >= 1000:
                     self.save_checkpoint(
                         epoch,
                         avg_loss,
                         os.path.join(self.config["output_dir"], f"checkpoint_step_{self.global_step}.pt"),
-                        is_step_checkpoint=True
+                        save_full_model=False  # 只保存可训练参数
                     )
                     last_save_step = self.global_step
                     
@@ -689,12 +690,18 @@ class Stage1PMCTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     torch.cuda.empty_cache()
                     continue
+                # elif "Expected all tensors to be on the same device" in error_msg:
+                #     print(f"设备不匹配错误: {error_msg[:100]}...")
+                #     # 打印调试信息
+                #     self.debug_device_mismatch()
                 else:
                     print(f"运行时错误: {e}")
                     # 重置状态
-                    if self.scaler is not None:
-                        self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    
+                    # 【重要】在异常后不要调用scaler.update()
+                    # 只在成功的迭代后更新scaler
                     continue
             except Exception as e:
                 print(f"训练步骤错误: {e}")
@@ -766,52 +773,161 @@ class Stage1PMCTrainer:
         return avg_loss
     
     def resume_from_checkpoint(self):
-        """从checkpoint恢复时也要注意dtype"""
+        """从checkpoint恢复 - 支持多种checkpoint格式"""
         checkpoint_dir = self.config["output_dir"]
         if not os.path.exists(checkpoint_dir):
+            print(f"检查点目录不存在: {checkpoint_dir}")
             return
         
-        checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_epoch_")]
-        if not checkpoints:
-            return
+        # 查找所有可能的checkpoint文件
+        all_checkpoints = []
         
-        epochs = []
-        for ckpt in checkpoints:
+        # 1. 查找epoch checkpoints
+        epoch_checkpoints = [f for f in os.listdir(checkpoint_dir) 
+                            if f.startswith("checkpoint_epoch_") and f.endswith(".pt")]
+        for ckpt in epoch_checkpoints:
             try:
                 epoch = int(ckpt.split("_")[-1].replace(".pt", ""))
-                epochs.append(epoch)
+                all_checkpoints.append({
+                    'type': 'epoch',
+                    'value': epoch,
+                    'filename': ckpt,
+                    'path': os.path.join(checkpoint_dir, ckpt)
+                })
             except:
                 continue
         
-        if not epochs:
+        # 2. 查找step checkpoints  
+        step_checkpoints = [f for f in os.listdir(checkpoint_dir) 
+                        if f.startswith("checkpoint_step_") and f.endswith(".pt")]
+        for ckpt in step_checkpoints:
+            try:
+                step = int(ckpt.split("_")[-1].replace(".pt", ""))
+                all_checkpoints.append({
+                    'type': 'step',
+                    'value': step,
+                    'filename': ckpt,
+                    'path': os.path.join(checkpoint_dir, ckpt)
+                })
+            except:
+                continue
+        
+        # 3. 查找interrupted checkpoints
+        interrupted_checkpoints = [f for f in os.listdir(checkpoint_dir) 
+                                if f.startswith("interrupted_epoch_") and f.endswith(".pt")]
+        for ckpt in interrupted_checkpoints:
+            try:
+                epoch = int(ckpt.split("_")[-1].replace(".pt", ""))
+                all_checkpoints.append({
+                    'type': 'interrupted',
+                    'value': epoch,
+                    'filename': ckpt,
+                    'path': os.path.join(checkpoint_dir, ckpt)
+                })
+            except:
+                continue
+        
+        if not all_checkpoints:
+            print("没有找到任何checkpoint文件")
             return
         
-        latest_epoch = max(epochs)
-        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{latest_epoch}.pt")
+        # 打印找到的所有checkpoints
+        print(f"\n发现 {len(all_checkpoints)} 个checkpoint文件:")
+        for ckpt in all_checkpoints:
+            print(f"  - {ckpt['filename']} (类型: {ckpt['type']}, 值: {ckpt['value']})")
         
-        print(f"\n发现checkpoint: {checkpoint_path}")
+        # 选择最新的checkpoint
+        # 优先级: interrupted > step > epoch
+        # 在同类型中选择值最大的
+        latest_checkpoint = None
+        
+        # 先按类型分组
+        by_type = {}
+        for ckpt in all_checkpoints:
+            if ckpt['type'] not in by_type:
+                by_type[ckpt['type']] = []
+            by_type[ckpt['type']].append(ckpt)
+        
+        # 按优先级选择
+        if 'interrupted' in by_type:
+            latest_checkpoint = max(by_type['interrupted'], key=lambda x: x['value'])
+            print(f"\n选择中断的checkpoint: {latest_checkpoint['filename']}")
+        elif 'step' in by_type:
+            latest_checkpoint = max(by_type['step'], key=lambda x: x['value'])
+            print(f"\n选择最新的step checkpoint: {latest_checkpoint['filename']}")
+        elif 'epoch' in by_type:
+            latest_checkpoint = max(by_type['epoch'], key=lambda x: x['value'])
+            print(f"\n选择最新的epoch checkpoint: {latest_checkpoint['filename']}")
+        
+        if latest_checkpoint is None:
+            print("无法选择合适的checkpoint")
+            return
+        
+        # 加载选中的checkpoint
+        checkpoint_path = latest_checkpoint['path']
+        print(f"正在加载: {checkpoint_path}")
+        
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
-            # 加载模型状态
-            self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            # 检查checkpoint类型
+            is_full_model = checkpoint.get("is_full_model", True)
             
-            # 重新确保gamma参数是FP32
-            if self.config.get("fp16", True):
-                for name, param in self.model.named_parameters():
-                    if 'gamma_attn' in name or 'gamma_ff' in name:
-                        param.data = param.data.float()
+            if is_full_model:
+                # 完整模型checkpoint
+                print("加载完整模型权重...")
+                self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            else:
+                # 只有可训练参数的checkpoint
+                print("加载可训练参数...")
+                trainable_state_dict = checkpoint["trainable_state_dict"]
+                
+                # 更新模型中的可训练参数
+                model_state_dict = self.model.state_dict()
+                for name, param in trainable_state_dict.items():
+                    if name in model_state_dict:
+                        model_state_dict[name].copy_(param)
+                    else:
+                        print(f"警告：参数 {name} 在模型中不存在")
+                
+                print(f"成功加载 {len(trainable_state_dict)} 个可训练参数")
             
+            # 加载优化器状态
+            print("加载优化器状态...")
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+            # 加载调度器状态
+            print("加载学习率调度器状态...")
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             
-            self.start_epoch = checkpoint["epoch"] + 1
+            # 恢复训练状态
+            self.start_epoch = checkpoint.get("epoch", 0) + 1
             self.global_step = checkpoint.get("global_step", 0)
             
-            print(f"成功恢复训练，从Epoch {self.start_epoch}开始")
+            # 如果是中断的checkpoint，不增加epoch
+            if latest_checkpoint['type'] == 'interrupted':
+                self.start_epoch = checkpoint.get("epoch", 0)  # 保持在同一个epoch
+                print(f"从中断的Epoch {self.start_epoch} 继续训练")
+            else:
+                print(f"从Epoch {self.start_epoch} 开始训练")
+            
+            print(f"全局步数: {self.global_step}")
+            print(f"上次训练损失: {checkpoint.get('loss', 'N/A')}")
+            print(f"Checkpoint时间: {checkpoint.get('timestamp', 'N/A')}")
+            
+            print("\n✓ 成功恢复训练状态！")
+            
         except Exception as e:
-            print(f"加载checkpoint失败: {e}")
-            print("将从头开始训练")
+            print(f"\n✗ 加载checkpoint失败: {e}")
+            print("详细错误信息:")
+            import traceback
+            traceback.print_exc()
+            
+            # 询问是否要从头开始
+            response = input("\n是否要从头开始训练? (y/n): ")
+            if response.lower() != 'y':
+                raise RuntimeError("用户取消训练")
+            print("将从头开始训练...")
     
     def monitor_memory(self):
         """监控GPU显存"""
@@ -820,19 +936,96 @@ class Stage1PMCTrainer:
             reserved = torch.cuda.memory_reserved() / 1024**3
             print(f"\nGPU内存: 已分配={allocated:.2f}GB, 已保留={reserved:.2f}GB")
     
-    def save_checkpoint(self, epoch, loss, path):
-        checkpoint = {
+    def save_checkpoint(self, epoch, loss, path, save_full_model=False, save_both=False):
+        """
+        灵活的checkpoint保存策略
+        
+        Args:
+            path: 保存路径
+            save_full_model: 是否保存完整模型
+            save_both: 是否同时保存完整版和轻量版（用于最终模型）
+        """
+        if save_both:
+            # 同时保存两个版本
+            base_path = path.replace('.pt', '')
+            
+            # 1. 保存完整版本
+            full_path = f"{base_path}_full.pt"
+            self._save_single_checkpoint(
+                epoch, loss, full_path, 
+                save_full_model=True
+            )
+            
+            # 2. 保存轻量版本
+            light_path = f"{base_path}_light.pt"
+            self._save_single_checkpoint(
+                epoch, loss, light_path,
+                save_full_model=False
+            )
+            
+            print(f"已保存两个版本的checkpoint:")
+            print(f"  - 完整版: {full_path}")
+            print(f"  - 轻量版: {light_path}")
+            
+        else:
+            # 保存单个版本
+            self._save_single_checkpoint(epoch, loss, path, save_full_model)
+    
+    def _save_single_checkpoint(self, epoch, loss, path, save_full_model=False):
+        """
+        实际的保存逻辑
+        """
+        # 获取可训练参数
+        trainable_state_dict = {
+            name: param.data.cpu().clone()  # 保存到CPU以节省GPU内存
+            for name, param in self.model.named_parameters() 
+            if param.requires_grad
+        }
+        
+        # 基础checkpoint信息
+        base_checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "loss": loss,
             "config": self.config,
             "global_step": self.global_step,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "pytorch_version": torch.__version__,
+            "trainable_params_count": len(trainable_state_dict),
+            "trainable_params_names": list(trainable_state_dict.keys())
         }
-        torch.save(checkpoint, path)
-        print(f"检查点已保存: {path}")
+        
+        if save_full_model:
+            # 保存完整模型
+            checkpoint = {
+                **base_checkpoint,
+                "model_state_dict": self.model.state_dict(),
+                "is_full_model": True,
+                "checkpoint_type": "full"
+            }
+        else:
+            # 只保存可训练参数
+            checkpoint = {
+                **base_checkpoint,
+                "trainable_state_dict": trainable_state_dict,
+                "is_full_model": False,
+                "checkpoint_type": "light"
+            }
+        
+        # 安全保存（先保存到临时文件）
+        temp_path = path + ".tmp"
+        torch.save(checkpoint, temp_path)
+        
+        import shutil
+        shutil.move(temp_path, path)
+        
+        # 显示文件信息
+        file_size = os.path.getsize(path) / (1024**3)  # GB
+        print(f"✓ Checkpoint已保存: {os.path.basename(path)}")
+        print(f"  - 大小: {file_size:.2f} GB")
+        print(f"  - 类型: {checkpoint['checkpoint_type']}")
+        print(f"  - 可训练参数: {checkpoint['trainable_params_count']}个")
     
     def train(self):
         """
@@ -861,17 +1054,18 @@ class Stage1PMCTrainer:
                 val_loss = self.validate(epoch)
                 print(f"验证损失: {val_loss:.4f}")
                 
-                # 保存最佳模型
+                # 保存最佳模型（同时保存两个版本）
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     self.save_checkpoint(
                         epoch,
                         val_loss,
-                        os.path.join(self.config["output_dir"], "best_model.pt")
+                        os.path.join(self.config["output_dir"], "best_model.pt"),
+                        save_both=True  # 同时保存两个版本
                     )
-                    print(f"保存最佳模型 (val_loss: {val_loss:.4f})")
+                    print(f"新的最佳模型 (val_loss: {val_loss:.4f})")
                 
-                # 每个epoch都保存checkpoint（重要！）
+                # 每个epoch都保存checkpoint（重要！）只保存轻量版
                 self.save_checkpoint(
                     epoch,
                     val_loss,
@@ -901,6 +1095,15 @@ class Stage1PMCTrainer:
                 print(f"\nEpoch {epoch+1} 出现错误: {e}")
                 print("尝试继续下一个epoch...")
                 continue
+
+        # 训练结束时保存最终模型（两个版本）
+        print("\n保存最终模型...")
+        self.save_checkpoint(
+            self.config["num_epochs"] - 1,
+            val_loss,
+            os.path.join(self.config["output_dir"], "final_model.pt"),
+            save_both=True
+        )
         
         print("\n" + "="*50)
         print("训练完成！")
@@ -998,7 +1201,7 @@ def main():
 
         # Open-PMC-18M配置
         "pmc_base_url": "https://hf-mirror.com/datasets/vector-institute/open-pmc-18m/resolve/main",
-        "num_shards": 100,
+        "num_shards": 200,
         "use_chinese_mirror": True,
         "mirror_endpoint": "https://hf-mirror.com",
         "shuffle_buffer": 5000,
@@ -1008,16 +1211,17 @@ def main():
         "gradient_accumulation_steps": 8,  # 有效batch size = 16
         "learning_rate": 2e-5,
         "weight_decay": 0.01,
-        "num_epochs": 5,
+        "num_epochs": 3,
         "warmup_steps": 1000,
         "max_grad_norm": 1.0,
-        "max_length": 512,
+        "max_length": 1024,
         "image_size": 224,
 
-        # 优化设置 - 必须使用fp16
-        "fp16": True,  # 强制使用fp16混合精度
+        # 优化设置
+        "fp16": True,  # fp16混合精度
         "use_8bit_adam": True,  # 8-bit优化器节省显存
-        "use_gradient_checkpointing": True,  # 新增：梯度检查点
+        "use_mixed_precision": True,  # 混合精度
+        "use_gradient_checkpointing": True,  # 梯度检查点
 
         # 保存设置
         "output_dir": "./checkpoints/stage1_pmc18m",
@@ -1053,7 +1257,8 @@ def main():
             pmc_checkpoint_path=config["pmc_checkpoint_path"],
             stage="stage1",
             use_gradient_checkpointing=config.get("use_gradient_checkpointing", False),
-            dtype=torch.float16  # 确保使用fp16
+            # dtype=torch.float16,  # Base model in FP16, trainable in FP32
+            use_mixed_precision=config.get("use_mixed_precision", True)  # Enable mixed precision
         )
         print("模型创建成功（使用fp16混合精度）")
         
@@ -1106,7 +1311,7 @@ def main():
 
 if __name__ == "__main__":
     # 设置环境变量
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     
     # 设置PyTorch以优化显存使用

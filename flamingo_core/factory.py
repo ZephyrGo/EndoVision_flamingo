@@ -58,11 +58,15 @@ def create_model_and_transforms(
         qformer_depth: int = 2,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
-        gradient_checkpointing: bool = False,  # 新增参数
+        gradient_checkpointing: bool = False,  # 梯度检查
+        use_mixed_precision: bool = True,   # 使用混合精度
         **kwargs
 ):
     """
     使用新的BioMedicalLlamaFlamingo创建模型
+        创建具有正确混合精度设置的模型：
+    - 冻结的基础模型使用 FP16 以节省显存
+    - 可训练参数使用 FP32 以保证梯度稳定性
     """
     
     # 1. 加载分词器并添加特殊token
@@ -102,7 +106,7 @@ def create_model_and_transforms(
         gradient_checkpointing=gradient_checkpointing
     )
     
-    # 4. 初始化双轨视觉编码器（保持不变）
+    # 4. 初始化双轨视觉编码器（frozen parts stay FP16）
     vision_encoder = DualVisualAdapter(
         cfg=DummyCfg(),
         endo_checkpoint_path=endo_checkpoint_path,
@@ -120,6 +124,10 @@ def create_model_and_transforms(
         num_queries=num_queries,
         qformer_depth=qformer_depth,
     )
+
+    # 将冻结的视觉编码器参数放入fp16   
+    vision_encoder = vision_encoder.to(device=device)
+
     
     # 5. 创建Flamingo模型
     model = Flamingo(
@@ -130,30 +138,80 @@ def create_model_and_transforms(
         vis_dim=target_hidden_dim,
         cross_attn_every_n_layers=cross_attn_every_n_layers
     )
-    
+    model = model.to(device=device)  # 确保整个模型在GPU上
+
     # 6. 设置可训练参数（优化）
     model.requires_grad_(False)  # 先冻结所有
-    
-    # 解冻交叉注意力层（已经在init_flamingo_cross_attention中处理）
-    
-    # 解冻视觉适配器的关键组件
+     
+    # 解冻视觉适配器的关键组件和交叉注意力层
     trainable_patterns = [
+        "gated_cross_attn_layers",  # Flamingo cross-attention
         "perceiver_resampler",
         "linear_proj",
         "qformer",
         "endo_token",
         "pmc_token"
     ]
-    
-    for name, param in model.named_parameters():
-        if any(pattern in name for pattern in trainable_patterns):
-            param.requires_grad = True
             
     # 7. 移动到设备并设置精度
-    model = model.to(device=device, dtype=dtype)
+    if use_mixed_precision:
+        print("Setting up mixed precision training...")
+        print("  - Frozen parameters (base model): FP16")
+        print("  - Trainable parameters: FP32")
+        
+        # Keep frozen parts in FP16 to save memory
+        for name, param in model.named_parameters():
+            if not any(pattern in name for pattern in trainable_patterns):
+                # Frozen parameters stay in FP16
+                param.data = param.data.to(dtype=dtype)
+            else:
+                # Trainable parameters must be FP32 for GradScaler
+                param.data = param.data.to(dtype=torch.float32)
+                param.requires_grad = True
+                
+        # Special handling for gated attention parameters
+        if hasattr(model.lang_encoder, 'gated_cross_attn_layers'):
+            for layer in model.lang_encoder.gated_cross_attn_layers:
+                if layer is not None:
+                    for param in layer.parameters():
+                        param.data = param.data.float()  # Ensure FP32
+                        param.requires_grad = True
+    else:
+        # No mixed precision - all parameters in specified dtype
+        print(f"Standard precision training with dtype={dtype}")
+        model = model.to(device=device, dtype=dtype)
+        
+        for name, param in model.named_parameters():
+            if any(pattern in name for pattern in trainable_patterns):
+                param.requires_grad = True
     
     # 8. 打印参数统计
+    print("\nParameter dtype configuration:")
+    fp16_params = 0
+    fp32_params = 0
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float16:
+            fp16_params += param.numel()
+        elif param.dtype == torch.float32:
+            fp32_params += param.numel()
+            
+    print(f"  FP16 parameters: {fp16_params:,} ({fp16_params/1e6:.1f}M)")
+    print(f"  FP32 parameters: {fp32_params:,} ({fp32_params/1e6:.1f}M)")
+    
+    # Print trainable parameters
     print_trainable_parameters(model)
+    
+    # 9. Create a custom forward wrapper to handle mixed dtypes
+    original_forward = model.forward
+    
+    def mixed_precision_forward(vision_x=None, lang_x=None, attention_mask=None, labels=None, **kwargs):
+        # Ensure inputs are in correct dtype
+        if vision_x is not None:
+            vision_x = vision_x.to(dtype=torch.float16)  # Vision always FP16 for autocast
+        return original_forward(vision_x=vision_x, lang_x=lang_x, attention_mask=attention_mask, labels=labels, **kwargs)
+    
+    if use_mixed_precision:
+        model.forward = mixed_precision_forward
     
     return model, tokenizer
 
@@ -164,10 +222,11 @@ def create_model_for_training(
         pmc_checkpoint_path: str,
         stage: str = "stage1",
         use_gradient_checkpointing: bool = False,
+        use_mixed_precision: bool = True,  # Default to mixed precision
         **kwargs
 ):
     """
-    根据训练阶段创建模型，使用新架构
+    根据训练阶段创建模型
     """
     if stage == "stage1":
         return create_model_and_transforms(
@@ -175,10 +234,12 @@ def create_model_for_training(
             tokenizer_path=base_model_path,
             endo_checkpoint_path=endo_checkpoint_path,
             pmc_checkpoint_path=pmc_checkpoint_path,
-            enable_endo=False,  # Stage 1不使用Endo
+            enable_endo=False,  # Stage 1 doesn't use Endo
             enable_pmc=True,
             cross_attn_every_n_layers=6,
             gradient_checkpointing=use_gradient_checkpointing,
+            use_mixed_precision=use_mixed_precision,
+            dtype=torch.float16 if use_mixed_precision else torch.float32,
             **kwargs
         )
     else:  # stage2
@@ -187,9 +248,11 @@ def create_model_for_training(
             tokenizer_path=base_model_path,
             endo_checkpoint_path=endo_checkpoint_path,
             pmc_checkpoint_path=pmc_checkpoint_path,
-            enable_endo=True,  # Stage 2启用双轨
+            enable_endo=True,  # Stage 2 uses both branches
             enable_pmc=True,
             cross_attn_every_n_layers=4,
             gradient_checkpointing=use_gradient_checkpointing,
+            use_mixed_precision=use_mixed_precision,
+            dtype=torch.float16 if use_mixed_precision else torch.float32,
             **kwargs
         )
