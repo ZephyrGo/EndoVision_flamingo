@@ -22,6 +22,7 @@ from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 
 from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 import numpy as np
 from tqdm import tqdm
 import json
@@ -176,52 +177,31 @@ class PMC18MStreamingDataset:
     def extract_caption(self, metadata):
         """
         从元数据中提取标题/描述
-        根据Open-PMC-18M的实际数据结构调整
-        
-        Args:
-            metadata: JSON元数据或字符串
-            
-        Returns:
-            提取的文本
+        适配PMC-18M的实际数据结构
         """
         try:
-            # 处理不同的元数据格式
             if isinstance(metadata, bytes):
                 metadata = metadata.decode('utf-8')
             
             if isinstance(metadata, str):
-                # 尝试解析为JSON
                 try:
                     metadata = json.loads(metadata)
                 except:
-                    # 如果不是JSON，直接使用字符串
                     return metadata
             
-            # Open-PMC-18M的数据结构
-            # 根据Dataset Card，主要字段是：
-            # - Full caption: 原始图表标题
-            caption = ""
-            
+            # PMC-18M的实际字段是 "caption"
             if isinstance(metadata, dict):
-                # 尝试不同的字段名
-                caption = (
-                    metadata.get('full_caption', '') or
-                    metadata.get('caption', '') or
-                    metadata.get('text', '') or
-                    metadata.get('description', '')
-                )
+                caption = metadata.get('caption', '')
                 
-                # 如果有多个子标题，合并它们
-                if 'sub_captions' in metadata:
-                    sub_captions = metadata['sub_captions']
-                    if isinstance(sub_captions, list):
-                        caption = caption + " " + " ".join(sub_captions)
-            
-            # 清理文本
-            caption = caption.strip()
-            
-            return caption if caption else "Medical image from research paper."
-            
+                if not caption:
+                    # 备用字段
+                    caption = metadata.get('text', '') or metadata.get('description', '')
+                
+                # 清理文本 - 去除多余的空格和换行
+                caption = ' '.join(caption.split())
+                
+                return caption if caption else "Medical figure from research paper."
+                
         except Exception as e:
             print(f"标题提取错误: {e}")
             return "Medical image without description."
@@ -252,13 +232,20 @@ class PMC18MStreamingDataset:
             # 处理图像
             image_tensor = self.process_image(image)
             
-            # 提取文本
+            # 处理文本
             caption = self.extract_caption(metadata)
             
-            # 构建输入文本（Flamingo格式）
-            input_text = "<image> Describe the medical findings:"
+            # PMC-18M的caption通常很长，可能需要智能截断
+            if len(caption) > 2000:  # 如果太长
+                # 保留开头和结尾部分（通常包含关键信息）
+                words = caption.split()
+                if len(words) > 200:
+                    caption = ' '.join(words[:150] + ['...'] + words[-50:])
+            
+            # 构建输入 - 使用更简洁的prompt以留出空间给caption
+            input_text = "<image> Describe this figure:"  # 更短的prompt
             target_text = caption
-
+            
             full_text = f"{input_text} {target_text} <|endofchunk|>"
             
             # Tokenization
@@ -270,10 +257,10 @@ class PMC18MStreamingDataset:
                 return_tensors="pt"
             )
             
-            # 创建标签（屏蔽输入部分）
+            # 创建标签
             labels = encodings.input_ids.clone()
             
-            # 计算输入部分的长度            # 【重要修改】分别编码以准确计算长度
+            # 计算输入部分的长度
             input_encoding = self.tokenizer(
                 input_text,
                 add_special_tokens=True,
@@ -281,37 +268,20 @@ class PMC18MStreamingDataset:
             )
             input_len = input_encoding.input_ids.shape[1]
             
-            # 1. 输入部分不计算loss
+            # 屏蔽输入和padding
             labels[0, :input_len] = -100
-            
-            # 2. 【关键】padding部分也不计算loss
-            # 找到padding开始的位置
             pad_token_id = self.tokenizer.pad_token_id
             if pad_token_id is not None:
-                # 将所有padding token设为-100
                 labels[labels == pad_token_id] = -100
             
-            # 3. 【新增】检查是否有有效标签
+            # 统计有效标签
             valid_labels = (labels != -100).sum()
-            if valid_labels < 10:  # 如果有效标签太少
-                print(f"Warning: Only {valid_labels} valid labels in this sample")
-                # 可以选择跳过这个样本，或者使用一个默认的较长caption
-                if valid_labels == 0:
-                    # 使用一个默认的较长描述
-                    default_caption = "This is a medical image showing anatomical structures. The image displays various tissue types and organs that require careful examination for diagnostic purposes."
-                    full_text = f"{input_text} {default_caption} <|endofchunk|>"
-                    
-                    encodings = self.tokenizer(
-                        full_text,
-                        max_length=self.max_length,
-                        padding="max_length",
-                        truncation=True,
-                        return_tensors="pt"
-                    )
-                    
-                    labels = encodings.input_ids.clone()
-                    labels[0, :input_len] = -100
-                    labels[labels == pad_token_id] = -100
+            
+            # 如果有效标签太少，说明文本被截断太多
+            # 质量检查 - 跳过低质量样本
+            if valid_labels < 20:
+                print(f"跳过低质量样本: 只有 {valid_labels} 个有效标签")
+                return None
             
             return {
                 "images": image_tensor,
@@ -357,6 +327,14 @@ class PMC18MStreamingDataset:
             WebDataset DataLoader
         """
         print(f"创建WebDataset，batch_size={batch_size}, num_workers={num_workers}")
+
+        # 初始化统计
+        self.label_stats = []
+        
+        # 过滤函数
+        def filter_none(sample):
+            """过滤掉None样本"""
+            return sample is not None
         
         # 创建WebDataset管道
         dataset = (
@@ -371,6 +349,7 @@ class PMC18MStreamingDataset:
             .decode("pil", handler=wds.warn_and_continue)
             # 适配可能的文件扩展名
             .to_tuple("jpg;png;jpeg;JPG;PNG;JPEG", "json;txt;caption", handler=wds.warn_and_continue)
+            .select(filter_none)  # 过滤掉None值
             .map(self.process_sample, handler=wds.warn_and_continue)
             .batched(batch_size, partial=False)
         )
@@ -486,7 +465,8 @@ class Stage1PMCTrainer:
                     trainable_params,
                     lr=config["learning_rate"],
                     weight_decay=config.get("weight_decay", 0.01),
-                    betas=(0.9, 0.999)
+                    betas=(0.9, 0.95),
+                    eps=1e-5  # 增加epsilon以提高数值稳定性
                 )
                 print("使用8-bit AdamW优化器")
             except ImportError:
@@ -505,10 +485,11 @@ class Stage1PMCTrainer:
 
         # 学习率调度器
         num_training_steps = self.steps_per_epoch * config["num_epochs"]
-        self.scheduler = get_linear_schedule_with_warmup(
+        self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=config.get("warmup_steps", 500),
-            num_training_steps=num_training_steps
+            num_training_steps=num_training_steps,
+            num_cycles=0.5  # 半个余弦周期，确保学习率持续下降
         )
 
         # 混合精度训练设置
@@ -552,6 +533,9 @@ class Stage1PMCTrainer:
         self.model.train()
         total_loss = 0
         num_steps = 0
+
+        patience = 5  # 连续5个checkpoint不改善就降低学习率
+
         
         # 创建进度条
         progress_bar = tqdm(
@@ -668,9 +652,9 @@ class Stage1PMCTrainer:
                         "grad_norm": grad_norm if grad_norm > 0 else 0
                     })
                     
-                # 显存监控
-                if step % 100 == 0:
-                    self.monitor_memory()
+                # # 显存监控
+                # if step % 100 == 0:
+                #     self.monitor_memory()
                     
                 # 定期保存checkpoint（只保存可训练参数）
                 if self.global_step > 0 and self.global_step - last_save_step >= 1000:
@@ -681,6 +665,22 @@ class Stage1PMCTrainer:
                         save_full_model=False  # 只保存可训练参数
                     )
                     last_save_step = self.global_step
+
+                # 每1000步检查一次
+                bad_epochs = 0
+                best_recent_loss = float('inf')
+                if self.global_step % 1000 == 0:
+                    if avg_loss > best_recent_loss:
+                        bad_epochs += 1
+                        if bad_epochs >= patience:
+                            # 降低学习率
+                            for param_group in self.optimizer.param_groups:
+                                param_group['lr'] *= 0.5
+                            print(f"降低学习率到: {param_group['lr']}")
+                            bad_epochs = 0
+                    else:
+                        best_recent_loss = avg_loss
+                        bad_epochs = 0
                     
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -710,6 +710,7 @@ class Stage1PMCTrainer:
             # 达到预定步数后停止
             if num_steps >= self.steps_per_epoch:
                 break
+        
                 
         return total_loss / num_steps if num_steps > 0 else float('inf')
 
@@ -1208,12 +1209,12 @@ def main():
 
         # 训练参数 - 针对A6000 48GB优化
         "batch_size": 2,  # 小批次以避免OOM
-        "gradient_accumulation_steps": 8,  # 有效batch size = 16
-        "learning_rate": 2e-5,
+        "gradient_accumulation_steps": 4,  # 有效batch size = 8
+        "learning_rate": 5e-6,
         "weight_decay": 0.01,
         "num_epochs": 3,
-        "warmup_steps": 1000,
-        "max_grad_norm": 1.0,
+        "warmup_steps": 2000,
+        "max_grad_norm": 0.5,
         "max_length": 1024,
         "image_size": 224,
 
