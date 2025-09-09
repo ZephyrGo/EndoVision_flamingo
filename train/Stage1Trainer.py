@@ -123,8 +123,9 @@ class PMC18MStreamingDataset:
                 ),
                 transforms.ToTensor(),
                 transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
+                    mean = [0.48145466, 0.4578275, 0.40821073],
+                    std  = [0.26862954, 0.26130258, 0.27577711]
+
                 )
             ])
         else:
@@ -133,8 +134,8 @@ class PMC18MStreamingDataset:
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
+                    mean = [0.48145466, 0.4578275, 0.40821073],
+                    std  = [0.26862954, 0.26130258, 0.27577711]
                 )
             ])
     
@@ -383,6 +384,10 @@ class Stage1PMCTrainer:
         self.tokenizer = tokenizer
         self.config = config
 
+        self.bad_epochs = 0
+        self.best_recent_loss = float('inf')
+        self.patience = 3
+
         # 设置设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用设备: {self.device}")
@@ -499,8 +504,8 @@ class Stage1PMCTrainer:
             self.scaler = GradScaler(
                 init_scale=2.**16,
                 growth_factor=2.0,
-                backoff_factor=0.5,
-                growth_interval=2000,
+                backoff_factor=0.25,
+                growth_interval=1000,
                 enabled=True
             )
             print("启用fp16混合精度训练（GradScaler）")
@@ -533,9 +538,6 @@ class Stage1PMCTrainer:
         self.model.train()
         total_loss = 0
         num_steps = 0
-
-        patience = 5  # 连续5个checkpoint不改善就降低学习率
-
         
         # 创建进度条
         progress_bar = tqdm(
@@ -545,7 +547,7 @@ class Stage1PMCTrainer:
         
         # 流式训练循环
         data_iter = iter(self.train_loader)
-        last_save_step = 0
+        last_save_step = self.global_step
         
         for step in progress_bar:
             try:
@@ -637,7 +639,7 @@ class Stage1PMCTrainer:
                 # 更新进度条
                 progress_bar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
-                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                     "step": self.global_step,
                     "grad_norm": f"{grad_norm:.2f}" if grad_norm > 0 else "N/A"
                 })
@@ -666,21 +668,19 @@ class Stage1PMCTrainer:
                     )
                     last_save_step = self.global_step
 
-                # 每1000步检查一次
-                bad_epochs = 0
-                best_recent_loss = float('inf')
-                if self.global_step % 1000 == 0:
-                    if avg_loss > best_recent_loss:
-                        bad_epochs += 1
-                        if bad_epochs >= patience:
-                            # 降低学习率
+                # 每200步检查一次
+
+                if self.global_step % 200 == 0:
+                    if avg_loss > self.best_recent_loss:
+                        self.bad_epochs += 1
+                        if self.bad_epochs >= self.patience:
                             for param_group in self.optimizer.param_groups:
                                 param_group['lr'] *= 0.5
                             print(f"降低学习率到: {param_group['lr']}")
-                            bad_epochs = 0
+                            self.bad_epochs = 0
                     else:
-                        best_recent_loss = avg_loss
-                        bad_epochs = 0
+                        self.best_recent_loss = avg_loss
+                        self.bad_epochs = 0
                     
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -900,9 +900,13 @@ class Stage1PMCTrainer:
             # 加载调度器状态
             print("加载学习率调度器状态...")
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+            for g in self.optimizer.param_groups:
+                g["lr"] = self.config["learning_rate"]
+
             
             # 恢复训练状态
-            self.start_epoch = checkpoint.get("epoch", 0) + 1
+            self.start_epoch = checkpoint.get("epoch", 0)
             self.global_step = checkpoint.get("global_step", 0)
             
             # 如果是中断的checkpoint，不增加epoch
@@ -1212,9 +1216,9 @@ def main():
         "gradient_accumulation_steps": 4,  # 有效batch size = 8
         "learning_rate": 5e-6,
         "weight_decay": 0.01,
-        "num_epochs": 3,
+        "num_epochs": 5,
         "warmup_steps": 2000,
-        "max_grad_norm": 0.5,
+        "max_grad_norm": 0.25,
         "max_length": 1024,
         "image_size": 224,
 

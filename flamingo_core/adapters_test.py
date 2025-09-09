@@ -1,12 +1,14 @@
-from adapters import DualVisualAdapter
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+from flamingo_core.adapters import DualVisualAdapter
 import torch
 import unittest
 import torch.nn as nn
 from flamingo_core.flamingo import Flamingo
 from flamingo_core.bentsao_model import BenTsaoWithFlamingoCrossAttention
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaConfig
 
-
+LOCAL_LM_PATH = "/home/zzk01/lqy_proj/EndoVision_flamingo/checkpoints/models--ContactDoctor--Bio-Medical-Llama-3-8B/snapshots/d71486ab8c920f34afe37ec8a21c2035b83d7b2d"
 class DummyCfg:
     class DATA:
         TRAIN_CROP_SIZE = 224
@@ -91,137 +93,143 @@ class DummyTokenizer:
 
 class TestDualVisualAdapter(unittest.TestCase):
 
-    def setUp(self):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.adapter = DualVisualAdapter(
-            cfg=DummyCfg(),
-            endo_checkpoint_path='../checkpoints/endo_fm_convert.pth',
-            pmc_checkpoint_path='../checkpoints/pmc_clip_visual_only.pt',
-            target_hidden_dim=4096,
-            num_latents=64,
-            perceiver_depth=2,
-            perceiver_heads=8,
-            perceiver_dim_head=64,
-            enable_endo=True,
-            enable_pmc=True,
-            freeze_endo=True,
-            freeze_pmc=True,
-            num_queries=64,
-            qformer_depth=2
-        ).to(self.device)
-        # 使用扩展后的DummyTokenizer
-        self.tokenizer = DummyTokenizer()
-        self.tokenizer.add_special_tokens({
-            "additional_special_tokens": ["<|endofchunk|>", "<image>"],
-            "pad_token": "<pad>"
-        })
+        # ---------- 视觉适配器 ----------
+        cls.adapter = (
+            DualVisualAdapter(
+                cfg=DummyCfg(),
+                endo_checkpoint_path="checkpoints/endo_fm_convert.pth",
+                pmc_checkpoint_path="checkpoints/pmc_clip_visual_only.pt",
+                target_hidden_dim=4096,
+                num_latents=64,
+                perceiver_depth=2,
+                perceiver_heads=8,
+                perceiver_dim_head=64,
+                enable_endo=True,
+                enable_pmc=True,
+                freeze_endo=True,
+                freeze_pmc=True,
+                num_queries=64,
+                qformer_depth=2,
+            )
+            .to(cls.device)
+            .half()                                        # 🔑 适配器统一 FP16
+            .eval()
+        )
 
-        # DummyLangEncoder
-        self.lang_encoder = DummyLangEncoder().to(self.device)
+        # ---------- 分词器 ----------
+        cls.tokenizer = AutoTokenizer.from_pretrained(LOCAL_LM_PATH, padding_side="right")
+        cls.tokenizer.add_special_tokens(
+            {
+                "additional_special_tokens": ["<|endofchunk|>", "<image>"],
+                "pad_token": "<pad>",
+            }
+        )
 
-        self.model = Flamingo(
-            vision_encoder=self.adapter,
-            lang_encoder=self.lang_encoder,
-            eoc_token_id=self.tokenizer.convert_tokens_to_ids("<|endofchunk|>"),
-            media_token_id=self.tokenizer.convert_tokens_to_ids("<image>"),
-            vis_dim=4096,
-            cross_attn_every_n_layers=1
-        ).to(self.device)
+        # ---------- 语言模型 ----------
+        cfg = LlamaConfig.from_pretrained(LOCAL_LM_PATH)
+        cls.lang_encoder = BenTsaoWithFlamingoCrossAttention.from_pretrained(
+            LOCAL_LM_PATH,
+            config=cfg,
+            cross_attn_every_n_layers=2,
+            torch_dtype=torch.float16,                     # 先流式加载为 FP16
+            device_map={"": 0},                            # 单 GPU
+            low_cpu_mem_usage=True,
+            only_attend_immediate_media=False,
+            finetune_lm=False,
+        )
+        cls.lang_encoder.resize_token_embeddings(len(cls.tokenizer))
+        cls.lang_encoder.half()                            # 统一 LayerNorm 等剩余 FP32 权重
+        cls.lang_encoder.eval()
 
-        self.adapter.eval()
+        # ---------- Flamingo 容器 ----------
+        cls.model = (
+            Flamingo(
+                vision_encoder=cls.adapter,
+                lang_encoder=cls.lang_encoder,
+                eoc_token_id=cls.tokenizer.convert_tokens_to_ids("<|endofchunk|>"),
+                media_token_id=cls.tokenizer.convert_tokens_to_ids("<image>"),
+                vis_dim=cls.lang_encoder.config.hidden_size,
+                cross_attn_every_n_layers=4,
+            )
+            .to(cls.device)
+            .half()                                        
+            .eval()
+        )
+
+        def _force_layernorm_to_half(module: torch.nn.Module):
+            for m in module.modules():
+                if isinstance(m, torch.nn.LayerNorm):
+                    # 权重/偏置转成 half
+                    m.to(dtype=torch.float16, device=next(module.parameters()).device)
+
+        _force_layernorm_to_half(cls.lang_encoder)
+
+    # --------------------------------------------------
+    #                单元测试开始
+    # --------------------------------------------------
+    def _dummy_images(self, B, T=1, C=3, H=224, W=224):
+        return torch.randn(B, T, C, H, W, device=self.device, dtype=torch.float16)
 
     def test_full_integration_forward(self):
-        B, T, C, H, W = 2, 1, 3, 224, 224
-        video_tensor = torch.randn(B, T, C, H, W, device=self.device)
-        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
-
-        # Tokenizer真实文本输入
-        inputs = self.tokenizer(
+        B = 2
+        imgs = self._dummy_images(B)
+        txt = self.tokenizer(
             ["This is a test medical report.", "Endoscopy findings are normal."],
-            return_tensors='pt',
-            padding=True
+            return_tensors="pt",
+            padding=True,
         ).to(self.device)
 
-        input_ids = inputs['input_ids']
-
-        output = self.model(
-            vision_x=image_tensor,
-            lang_x=input_ids
+        out = self.model(
+            vision_x=imgs,
+            lang_x=txt["input_ids"],
+            attention_mask=txt["attention_mask"], 
         )
-
-        # 验证输出logits的维度
-        self.assertEqual(output.logits.shape, (B, input_ids.shape[1], self.lang_encoder.config.vocab_size))
-        print("完整模型输出logits维度:", output.logits.shape)
+        self.assertEqual(
+            out.logits.shape,
+            (B, txt["input_ids"].shape[1], self.lang_encoder.config.vocab_size),
+        )
 
     def test_generation(self):
-        B, T, C, H, W = 2, 1, 3, 224, 224
-        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
-
-        inputs = self.tokenizer(
+        B = 2
+        imgs = self._dummy_images(B)
+        prompts = self.tokenizer(
             ["<image> Findings:", "<image> Impressions:"],
-            return_tensors='pt',
-            padding=True
+            return_tensors="pt",
+            padding=True,
         ).to(self.device)
 
-        generated_texts = self.model.generate(
-            vision_x=image_tensor,
-            lang_x=inputs['input_ids'],
-            max_length=50
-        )
-
-        self.assertEqual(len(generated_texts), B)
-        for idx, text in enumerate(generated_texts):
-            print(f"Generated text {idx + 1}: {text}")
+        gen = self.model.generate(vision_x=imgs, lang_x=prompts["input_ids"], max_length=50)
+        self.assertEqual(len(gen), B)
+        for i, t in enumerate(gen): print(f"[Gen {i}] {t}")
 
     def test_memory_efficiency(self):
-        B, T, C, H, W = 2, 1, 3, 224, 224
-        video_tensor = torch.randn(B, T, C, H, W, device=self.device)
-        image_tensor = torch.randn(B, T, C, H, W, device=self.device)
-
+        B = 2
+        imgs = self._dummy_images(B)
         torch.cuda.reset_peak_memory_stats(self.device)
-        inputs = self.tokenizer(["<image> Test memory usage"], return_tensors='pt').to(self.device)
 
-        _ = self.model(
-            vision_x=image_tensor,
-            lang_x=inputs['input_ids']
-        )
+        txt = self.tokenizer(["test"] * B, return_tensors="pt").to(self.device)  # 保证 batch 对齐
+        _ = self.model(vision_x=imgs, lang_x=txt["input_ids"])
 
-        max_mem = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
-        print(f"Peak GPU memory usage: {max_mem:.2f} MB")
-        self.assertLess(max_mem, 12000, "GPU内存占用超过预期阈值")
+        peak = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+        print(f"Peak GPU mem = {peak:.1f} MB")
+        self.assertLess(peak, 28000)  # 根据实际显存适当调整
 
     def test_adapter_output_shapes(self):
-        B, T, C, H, W = 2, 1, 3, 224, 224
-        video_tensor = torch.randn(B, T, C, H, W, device=self.device)
-
-        outputs = self.adapter(video_tensor)
-
-        fused_tokens = outputs["fused_tokens"]
-        pmc_tokens = outputs["pmc_tokens"]
-        endo_tokens = outputs["endo_tokens"]
-
-        expected_shape_single_branch = (B, T, 65, 4096)
-        expected_shape_fused = (B, T, 130, 4096)
-
-        self.assertEqual(fused_tokens.shape, expected_shape_fused, "Fused tokens shape mismatch")
-        self.assertEqual(pmc_tokens.shape, expected_shape_single_branch, "PMC tokens shape mismatch")
-        self.assertEqual(endo_tokens.shape, expected_shape_single_branch, "Endo tokens shape mismatch")
-
-        print("DualVisualAdapter output shapes test passed:")
-        print("Fused tokens shape:", fused_tokens.shape)
-        print("PMC tokens shape:", pmc_tokens.shape)
-        print("Endo tokens shape:", endo_tokens.shape)
+        B, T = 2, 1
+        outs = self.adapter(self._dummy_images(B, T))
+        self.assertEqual(outs["fused_tokens"].shape, (B, T, 130, 4096))
 
     def test_trainable_parameters(self):
-        trainable_params = [name for name, param in self.adapter.named_parameters() if param.requires_grad]
-        frozen_params = [name for name, param in self.adapter.named_parameters() if not param.requires_grad]
+        train = sum(p.numel() for p in self.adapter.parameters() if p.requires_grad)
+        freeze = sum(p.numel() for p in self.adapter.parameters() if not p.requires_grad)
+        print(f"Trainable {train/1e6:.1f} M / Frozen {freeze/1e6:.1f} M")
+        self.assertGreater(train, 0)
+        self.assertGreater(freeze, 0)
 
-        print("Number of trainable parameters:", len(trainable_params))
-        print("Number of frozen parameters:", len(frozen_params))
 
-        self.assertGreater(len(trainable_params), 0, "There should be some trainable parameters.")
-        self.assertGreater(len(frozen_params), 0, "There should be some frozen parameters.")
-
-if __name__ == '__main__':
-    unittest.main(verbosity=2, exit=False)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

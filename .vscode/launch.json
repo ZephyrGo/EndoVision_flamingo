@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run adapters_test as module",
+      "type": "python",
+      "request": "launch",
+      "module": "flamingo_core.adapters_test",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {"PYTHONPATH": "${workspaceRoot}"}
+    }
+  ]
+}

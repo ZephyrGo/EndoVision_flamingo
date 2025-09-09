@@ -8,6 +8,23 @@ import torch
 import torch.nn as nn
 from flamingo_core.bio_llama_flamingo import BioMedicalLlamaFlamingo  # 新导入
 
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
+import torch.distributed as dist
+from functools import partial
+
 class DummyCfg:
     """视觉编码器配置"""
 
@@ -256,3 +273,62 @@ def create_model_for_training(
             dtype=torch.float16 if use_mixed_precision else torch.float32,
             **kwargs
         )
+    
+def create_model_for_fsdp_training(
+    base_model_path: str,
+    endo_checkpoint_path: str, 
+    pmc_checkpoint_path: str,
+    stage: str = "stage1",
+    use_fsdp: bool = True,
+    **kwargs
+):
+    """为FSDP训练创建模型"""
+    
+    # 创建基础模型（不移动到设备）
+    model, tokenizer = create_model_and_transforms(
+        lang_encoder_path=base_model_path,
+        tokenizer_path=base_model_path,
+        endo_checkpoint_path=endo_checkpoint_path,
+        pmc_checkpoint_path=pmc_checkpoint_path,
+        enable_endo=(stage == "stage2"),
+        enable_pmc=True,
+        cross_attn_every_n_layers=6 if stage == "stage1" else 4,
+        device="cpu",  # 先在CPU上创建
+        dtype=torch.float32,  # FSDP会处理混合精度
+        **kwargs
+    )
+    
+    if use_fsdp:
+        # FSDP混合精度配置
+        fp16_policy = MixedPrecision(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float16,
+            buffer_dtype=torch.float16,
+        )
+        
+        # 自动包装策略 - 针对Transformer层
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        from flamingo_core.flamingo_lm import FlamingoLayer
+        
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                LlamaDecoderLayer,
+                FlamingoLayer,
+            },
+        )
+        
+        # FSDP配置
+        model = FSDP(
+            model,
+            auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=fp16_policy,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,  # 完全分片
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True,  # 重要：保持参数名称
+            limit_all_gathers=True,  # 减少显存峰值
+            sync_module_states=True,  # 同步模块状态
+        )
+    
+    return model, tokenizer
